@@ -1,0 +1,66 @@
+name: بناء تطبيق اللاسلكي الذكي
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'WalkieTalkiePro-project.zip'
+      - 'WalkieTalkie.zip'
+      - '.github/workflows/build-apk.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: تنزيل ملفات المستودع
+        uses: actions/checkout@v4
+
+      - name: تجهيز جافا وأندرويد
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: تجهيز Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: فك ضغط مشروع اللاسلكي
+        shell: bash
+        run: |
+          set -e
+          ARCHIVE=""
+          if [ -f "WalkieTalkiePro-project.zip" ]; then
+            ARCHIVE="WalkieTalkiePro-project.zip"
+          elif [ -f "WalkieTalkie.zip" ]; then
+            ARCHIVE="WalkieTalkie.zip"
+          else
+            echo "لم أجد ملف ZIP في جذر المستودع."
+            exit 1
+          fi
+
+          mkdir -p extracted-project
+          unzip -q "$ARCHIVE" -d extracted-project
+
+          PROJECT_DIR="$(find extracted-project -type f -name 'settings.gradle.kts' -print -quit | xargs -r dirname)"
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "لم أجد settings.gradle.kts داخل الملف المضغوط."
+            find extracted-project -maxdepth 4 -type f
+            exit 1
+          fi
+
+          cp -a "$PROJECT_DIR"/. .
+          test -f settings.gradle.kts
+          test -f app/build.gradle.kts
+
+      - name: بناء ملف APK
+        run: gradle assembleDebug
+
+      - name: إتاحة ملف APK للتنزيل
+        uses: actions/upload-artifact@v4
+        with:
+          name: WalkieTalkiePro-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
