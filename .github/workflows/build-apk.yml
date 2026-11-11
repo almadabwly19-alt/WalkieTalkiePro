@@ -1,0 +1,496 @@
+name: Build WalkieTalkiePro APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Generate complete Android project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/walkietalkie/pro app/src/main/res/values server
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "WalkieTalkiePro"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.walkietalkie.pro"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.walkietalkie.pro"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.hardware.bluetooth" android:required="false"/>
+              <uses-feature android:name="android.hardware.microphone" android:required="true"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
+              <application android:allowBackup="true" android:label="اللاسلكي الذكي"
+                  android:theme="@style/AppTheme" android:usesCleartextTraffic="true">
+                  <activity android:name=".MainActivity" android:screenOrientation="portrait" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+                  <item name="colorAccent">#20B7A5</item>
+                  <item name="android:statusBarColor">#08152D</item>
+                  <item name="android:navigationBarColor">#08152D</item>
+                  <item name="android:fontFamily">sans</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/java/com/walkietalkie/pro/MainActivity.kt <<'EOF'
+          package com.walkietalkie.pro
+
+          import android.Manifest
+          import android.bluetooth.*
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.media.*
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import okhttp3.*
+          import okio.ByteString
+          import java.io.BufferedInputStream
+          import java.io.BufferedOutputStream
+          import java.net.URLEncoder
+          import java.util.UUID
+          import kotlin.concurrent.thread
+
+          class MainActivity : AppCompatActivity() {
+              private val uuid = UUID.fromString("8e6f4a10-7a5b-4c3d-9a10-77d7b7f1a001")
+              private val rate = 16000
+              private var mode = "bt"
+              private var bt: BluetoothSocket? = null
+              private var ws: WebSocket? = null
+              @Volatile private var talking = false
+              private var recorder: AudioRecord? = null
+              private var track: AudioTrack? = null
+              private lateinit var status: TextView
+              private lateinit var devicesView: Spinner
+              private lateinit var urlView: EditText
+              private lateinit var roomView: EditText
+              private lateinit var ptt: Button
+              private var devices = listOf<BluetoothDevice>()
+              private val client = OkHttpClient.Builder().pingInterval(20, java.util.concurrent.TimeUnit.SECONDS).build()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  ui()
+                  permissions()
+                  refreshDevices()
+              }
+
+              private fun ui() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(22, 22, 22, 20)
+                      setBackgroundColor(0xFF08152D.toInt())
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "اللاسلكي الذكي"
+                      textSize = 28f
+                      gravity = Gravity.CENTER
+                      setTextColor(-1)
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "اتصال صوتي • اضغط باستمرار للتحدث"
+                      textSize = 14f
+                      gravity = Gravity.CENTER
+                      setTextColor(0xFFB8C8E8.toInt())
+                      setPadding(0, 6, 0, 18)
+                  })
+                  val modes = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  modes.addView(Button(this).apply {
+                      text = "البلوتوث"
+                      setOnClickListener { mode = "bt"; status.text = "وضع البلوتوث مستقل عن الإنترنت" }
+                  }, LinearLayout.LayoutParams(0, -2, 1f))
+                  modes.addView(Button(this).apply {
+                      text = "الإنترنت"
+                      setOnClickListener { mode = "net"; status.text = "وضع الإنترنت مستقل عن البلوتوث" }
+                  }, LinearLayout.LayoutParams(0, -2, 1f))
+                  root.addView(modes)
+                  status = TextView(this).apply {
+                      text = "الحالة: جاهز"
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      setTextColor(0xFF62E0CF.toInt())
+                      setPadding(0, 18, 0, 12)
+                  }
+                  root.addView(status)
+                  root.addView(TextView(this).apply {
+                      text = "البلوتوث"
+                      textSize = 18f
+                      setTextColor(-1)
+                  })
+                  devicesView = Spinner(this)
+                  root.addView(devicesView)
+                  val bts = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  bts.addView(Button(this).apply {
+                      text = "تحديث الأجهزة"; setOnClickListener { refreshDevices() }
+                  }, LinearLayout.LayoutParams(0, -2, 1f))
+                  bts.addView(Button(this).apply {
+                      text = "استضافة"; setOnClickListener { host() }
+                  }, LinearLayout.LayoutParams(0, -2, 1f))
+                  bts.addView(Button(this).apply {
+                      text = "اتصال"; setOnClickListener { connectBt() }
+                  }, LinearLayout.LayoutParams(0, -2, 1f))
+                  root.addView(bts)
+                  root.addView(TextView(this).apply {
+                      text = "الإنترنت"
+                      textSize = 18f
+                      setTextColor(-1)
+                      setPadding(0, 18, 0, 4)
+                  })
+                  urlView = EditText(this).apply {
+                      hint = "رابط خادم الصوت: wss://..."
+                      setSingleLine(true)
+                      setText("wss://YOUR-SERVER-HERE")
+                  }
+                  roomView = EditText(this).apply {
+                      hint = "اسم الغرفة"
+                      setSingleLine(true)
+                      setText("room1")
+                  }
+                  root.addView(urlView)
+                  root.addView(roomView)
+                  root.addView(Button(this).apply {
+                      text = "اتصال بغرفة الإنترنت"
+                      setOnClickListener { connectNet() }
+                  })
+                  ptt = Button(this).apply {
+                      text = "اضغط باستمرار للتحدث"
+                      textSize = 18f
+                      isAllCaps = false
+                      setTextColor(-1)
+                      setBackgroundColor(0xFF1457D9.toInt())
+                      setOnTouchListener { _, e ->
+                          when (e.action) {
+                              MotionEvent.ACTION_DOWN -> { startTalk(); true }
+                              MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { stopTalk(); true }
+                              else -> true
+                          }
+                      }
+                  }
+                  root.addView(ptt, LinearLayout.LayoutParams(-1, 125).apply { topMargin = 22 })
+                  root.addView(TextView(this).apply {
+                      text = "البلوتوث يحتاج اقتران الهاتفين. الإنترنت يحتاج نشر خادم الصوت الموجود في مجلد server ووضع رابطه هنا."
+                      textSize = 12f
+                      gravity = Gravity.CENTER
+                      setTextColor(0xFFB8C8E8.toInt())
+                      setPadding(4, 14, 4, 0)
+                  })
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              private fun permissions() {
+                  val p = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      p += Manifest.permission.BLUETOOTH_CONNECT
+                      p += Manifest.permission.BLUETOOTH_SCAN
+                  }
+                  val missing = p.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+                  if (missing.isNotEmpty()) ActivityCompat.requestPermissions(this, missing.toTypedArray(), 8)
+              }
+
+              @Suppress("MissingPermission")
+              private fun adapter(): BluetoothAdapter? =
+                  (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
+
+              @Suppress("MissingPermission")
+              private fun refreshDevices() {
+                  try {
+                      val a = adapter()
+                      if (a == null || !a.isEnabled) { status.text = "فعّل البلوتوث"; return }
+                      devices = a.bondedDevices.toList()
+                      val labels = if (devices.isEmpty()) listOf("لا توجد أجهزة مقترنة") else devices.map { "${it.name} — ${it.address}" }
+                      devicesView.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
+                      status.text = "الأجهزة المقترنة: ${devices.size}"
+                  } catch (_: SecurityException) { status.text = "اسمح بصلاحية البلوتوث" }
+              }
+
+              @Suppress("MissingPermission")
+              private fun host() {
+                  if (mode != "bt") { status.text = "اختر البلوتوث أولاً"; return }
+                  thread {
+                      try {
+                          val server = adapter()?.listenUsingRfcommWithServiceRecord("WalkieTalkiePro", uuid)
+                          runOnUiThread { status.text = "بانتظار اتصال الهاتف الآخر..." }
+                          val s = server?.accept()
+                          server?.close()
+                          if (s != null) attachBt(s)
+                      } catch (e: Exception) { runOnUiThread { status.text = "تعذرت الاستضافة: ${e.message}" } }
+                  }
+              }
+
+              @Suppress("MissingPermission")
+              private fun connectBt() {
+                  if (mode != "bt") { status.text = "اختر البلوتوث أولاً"; return }
+                  val d = devices.getOrNull(devicesView.selectedItemPosition)
+                  if (d == null) { status.text = "اقرن الهاتف الآخر من إعدادات البلوتوث"; return }
+                  thread {
+                      try {
+                          adapter()?.cancelDiscovery()
+                          val s = d.createRfcommSocketToServiceRecord(uuid)
+                          s.connect()
+                          attachBt(s)
+                      } catch (e: Exception) { runOnUiThread { status.text = "فشل الاتصال: ${e.message}" } }
+                  }
+              }
+
+              private fun attachBt(s: BluetoothSocket) {
+                  bt = s
+                  runOnUiThread { status.text = "متصل عبر البلوتوث" }
+                  thread {
+                      try {
+                          val input = BufferedInputStream(s.inputStream)
+                          while (s.isConnected) {
+                              val hi = input.read()
+                              if (hi < 0) break
+                              val lo = input.read()
+                              if (lo < 0) break
+                              val size = (hi shl 8) or lo
+                              if (size !in 1..4096) continue
+                              val data = ByteArray(size)
+                              var off = 0
+                              while (off < size) {
+                                  val n = input.read(data, off, size - off)
+                                  if (n < 0) break
+                                  off += n
+                              }
+                              if (off == size) play(data)
+                          }
+                      } catch (_: Exception) { runOnUiThread { status.text = "انقطع البلوتوث" } }
+                  }
+              }
+
+              private fun connectNet() {
+                  if (mode != "net") { status.text = "اختر الإنترنت أولاً"; return }
+                  val base = urlView.text.toString().trim()
+                  val room = roomView.text.toString().trim()
+                  if ((!base.startsWith("wss://") && !base.startsWith("ws://")) ||
+                      base.contains("YOUR-SERVER-HERE") || room.isBlank()) {
+                      status.text = "أدخل رابط خادم صحيحاً واسم غرفة"; return
+                  }
+                  val sep = if (base.contains("?")) "&" else "?"
+                  val req = Request.Builder().url(base + sep + "room=" + URLEncoder.encode(room, "UTF-8")).build()
+                  ws?.close(1000, "reconnect")
+                  ws = client.newWebSocket(req, object : WebSocketListener() {
+                      override fun onOpen(webSocket: WebSocket, response: Response) {
+                          runOnUiThread { status.text = "متصل بغرفة الإنترنت: $room" }
+                      }
+                      override fun onMessage(webSocket: WebSocket, bytes: ByteString) { play(bytes.toByteArray()) }
+                      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                          runOnUiThread { status.text = "فشل الإنترنت: ${t.message}" }
+                      }
+                  })
+              }
+
+              private fun startTalk() {
+                  if (talking) return
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      status.text = "اسمح باستخدام الميكروفون"; return
+                  }
+                  if (mode == "bt" && bt?.isConnected != true) { status.text = "اتصل أو استضف البلوتوث أولاً"; return }
+                  if (mode == "net" && ws == null) { status.text = "اتصل بغرفة الإنترنت أولاً"; return }
+                  talking = true
+                  ptt.text = "تتحدث الآن — ارفع إصبعك للإيقاف"
+                  thread {
+                      val min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                      val r = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, rate,
+                          AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 4096))
+                      recorder = r
+                      try {
+                          r.startRecording()
+                          val buf = ByteArray(2048)
+                          val out = bt?.let { BufferedOutputStream(it.outputStream) }
+                          while (talking) {
+                              val n = r.read(buf, 0, buf.size)
+                              if (n > 0) {
+                                  if (mode == "bt") {
+                                      out?.write((n shr 8) and 255)
+                                      out?.write(n and 255)
+                                      out?.write(buf, 0, n)
+                                      out?.flush()
+                                  } else {
+                                      ws?.send(ByteString.of(*buf.copyOf(n)))
+                                  }
+                              }
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { status.text = "توقف إرسال الصوت: ${e.message}" }
+                      } finally {
+                          try { r.stop() } catch (_: Exception) {}
+                          r.release()
+                          recorder = null
+                      }
+                  }
+              }
+
+              private fun stopTalk() {
+                  talking = false
+                  ptt.text = "اضغط باستمرار للتحدث"
+                  try { recorder?.stop() } catch (_: Exception) {}
+              }
+
+              @Synchronized
+              private fun play(data: ByteArray) {
+                  try {
+                      var t = track
+                      if (t == null) {
+                          val min = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                          t = AudioTrack.Builder()
+                              .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                              .setAudioFormat(AudioFormat.Builder().setSampleRate(rate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                                  .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
+                              .setBufferSizeInBytes(maxOf(min, 8192))
+                              .setTransferMode(AudioTrack.MODE_STREAM).build()
+                          track = t
+                          t.play()
+                      }
+                      t.write(data, 0, data.size)
+                  } catch (_: Exception) { runOnUiThread { status.text = "تعذر تشغيل الصوت" } }
+              }
+
+              override fun onDestroy() {
+                  talking = false
+                  try { bt?.close() } catch (_: Exception) {}
+                  try { ws?.close(1000, "closed") } catch (_: Exception) {}
+                  try { track?.stop(); track?.release() } catch (_: Exception) {}
+                  client.dispatcher.executorService.shutdown()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > server/package.json <<'EOF'
+          {"name":"walkietalkiepro-relay","version":"1.0.0","private":true,"scripts":{"start":"node server.js"},"dependencies":{"ws":"^8.18.0"}}
+          EOF
+
+          cat > server/server.js <<'EOF'
+          const http = require("http");
+          const WebSocket = require("ws");
+          const server = http.createServer((req, res) => {
+            res.writeHead(200, {"content-type":"text/plain; charset=utf-8"});
+            res.end("WalkieTalkiePro relay is running");
+          });
+          const wss = new WebSocket.Server({server});
+          const rooms = new Map();
+          wss.on("connection", (socket, req) => {
+            const u = new URL(req.url, "http://localhost");
+            const room = (u.searchParams.get("room") || "room1").slice(0, 80);
+            if (!rooms.has(room)) rooms.set(room, new Set());
+            rooms.get(room).add(socket);
+            socket.on("message", (data, binary) => {
+              if (!binary) return;
+              for (const peer of rooms.get(room)) {
+                if (peer !== socket && peer.readyState === WebSocket.OPEN) peer.send(data, {binary:true});
+              }
+            });
+            socket.on("close", () => {
+              const group = rooms.get(room);
+              if (group) { group.delete(socket); if (!group.size) rooms.delete(room); }
+            });
+          });
+          server.listen(process.env.PORT || 8080, "0.0.0.0");
+          EOF
+
+          cat > README_AR.md <<'EOF'
+          # اللاسلكي الذكي WalkieTalkiePro
+          هذا المشروع يُنشأ تلقائياً عند تشغيل سير العمل.
+          - تطبيق أندرويد بواجهة عربية وزر اضغط باستمرار للتحدث.
+          - بلوتوث Classic: أحد الهاتفين يستضيف والآخر يتصل بجهاز مقترن.
+          - الإنترنت: نقل صوت داخل غرفة مشتركة عبر خادم WebSocket.
+          ## تشغيل الإنترنت
+          انشر مجلد server على استضافة Node.js تدعم WebSocket، ثم ضع رابط wss:// في التطبيق على كلا الهاتفين واستخدم اسم الغرفة نفسه. لا يوجد خادم مستضاف مسبقاً.
+          ## تنبيه
+          نقل الصوت الحالي PCM خام، وهو نموذج أولي يحتاج اختباراً وتحسيناً وترميزاً صوتياً ومصادقة قبل الاستخدام العام. لا يستطيع التطبيق زيادة مدى البلوتوث أو قوة إرساله.
+          EOF
+
+      - name: Build APK with Gradle
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WalkieTalkiePro-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
