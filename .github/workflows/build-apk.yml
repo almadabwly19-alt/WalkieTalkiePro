@@ -119,6 +119,7 @@ jobs:
           import android.media.*
           import android.os.Build
           import android.os.Bundle
+          import android.text.InputType
           import android.view.Gravity
           import android.view.MotionEvent
           import android.widget.*
@@ -221,12 +222,14 @@ jobs:
                   })
                   urlView = EditText(this).apply {
                       hint = "رابط خادم الصوت: wss://..."
-                      setSingleLine(true)
+                      maxLines = 1
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
                       setText("wss://YOUR-SERVER-HERE")
                   }
                   roomView = EditText(this).apply {
                       hint = "اسم الغرفة"
-                      setSingleLine(true)
+                      maxLines = 1
+                      inputType = InputType.TYPE_CLASS_TEXT
                       setText("room1")
                   }
                   root.addView(urlView)
@@ -280,7 +283,7 @@ jobs:
                       val a = adapter()
                       if (a == null || !a.isEnabled) { status.text = "فعّل البلوتوث"; return }
                       devices = a.bondedDevices.toList()
-                      val labels = if (devices.isEmpty()) listOf("لا توجد أجهزة مقترنة") else devices.map { "${it.name} — ${it.address}" }
+                      val labels = if (devices.isEmpty()) listOf("لا توجد أجهزة مقترنة") else devices.map { "${it.name} —${it.address}" }
                       devicesView.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
                       status.text = "الأجهزة المقترنة: ${devices.size}"
                   } catch (_: SecurityException) { status.text = "اسمح بصلاحية البلوتوث" }
@@ -346,151 +349,4 @@ jobs:
                   val base = urlView.text.toString().trim()
                   val room = roomView.text.toString().trim()
                   if ((!base.startsWith("wss://") && !base.startsWith("ws://")) ||
-                      base.contains("YOUR-SERVER-HERE") || room.isBlank()) {
-                      status.text = "أدخل رابط خادم صحيحاً واسم غرفة"; return
-                  }
-                  val sep = if (base.contains("?")) "&" else "?"
-                  val req = Request.Builder().url(base + sep + "room=" + URLEncoder.encode(room, "UTF-8")).build()
-                  ws?.close(1000, "reconnect")
-                  ws = client.newWebSocket(req, object : WebSocketListener() {
-                      override fun onOpen(webSocket: WebSocket, response: Response) {
-                          runOnUiThread { status.text = "متصل بغرفة الإنترنت: $room" }
-                      }
-                      override fun onMessage(webSocket: WebSocket, bytes: ByteString) { play(bytes.toByteArray()) }
-                      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                          runOnUiThread { status.text = "فشل الإنترنت: ${t.message}" }
-                      }
-                  })
-              }
-
-              private fun startTalk() {
-                  if (talking) return
-                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-                      status.text = "اسمح باستخدام الميكروفون"; return
-                  }
-                  if (mode == "bt" && bt?.isConnected != true) { status.text = "اتصل أو استضف البلوتوث أولاً"; return }
-                  if (mode == "net" && ws == null) { status.text = "اتصل بغرفة الإنترنت أولاً"; return }
-                  talking = true
-                  ptt.text = "تتحدث الآن — ارفع إصبعك للإيقاف"
-                  thread {
-                      val min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                      val r = AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, rate,
-                          AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(min, 4096))
-                      recorder = r
-                      try {
-                          r.startRecording()
-                          val buf = ByteArray(2048)
-                          val out = bt?.let { BufferedOutputStream(it.outputStream) }
-                          while (talking) {
-                              val n = r.read(buf, 0, buf.size)
-                              if (n > 0) {
-                                  if (mode == "bt") {
-                                      out?.write((n shr 8) and 255)
-                                      out?.write(n and 255)
-                                      out?.write(buf, 0, n)
-                                      out?.flush()
-                                  } else {
-                                      ws?.send(ByteString.of(*buf.copyOf(n)))
-                                  }
-                              }
-                          }
-                      } catch (e: Exception) {
-                          runOnUiThread { status.text = "توقف إرسال الصوت: ${e.message}" }
-                      } finally {
-                          try { r.stop() } catch (_: Exception) {}
-                          r.release()
-                          recorder = null
-                      }
-                  }
-              }
-
-              private fun stopTalk() {
-                  talking = false
-                  ptt.text = "اضغط باستمرار للتحدث"
-                  try { recorder?.stop() } catch (_: Exception) {}
-              }
-
-              @Synchronized
-              private fun play(data: ByteArray) {
-                  try {
-                      var t = track
-                      if (t == null) {
-                          val min = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                          t = AudioTrack.Builder()
-                              .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                                  .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
-                              .setAudioFormat(AudioFormat.Builder().setSampleRate(rate).setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                                  .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-                              .setBufferSizeInBytes(maxOf(min, 8192))
-                              .setTransferMode(AudioTrack.MODE_STREAM).build()
-                          track = t
-                          t.play()
-                      }
-                      t.write(data, 0, data.size)
-                  } catch (_: Exception) { runOnUiThread { status.text = "تعذر تشغيل الصوت" } }
-              }
-
-              override fun onDestroy() {
-                  talking = false
-                  try { bt?.close() } catch (_: Exception) {}
-                  try { ws?.close(1000, "closed") } catch (_: Exception) {}
-                  try { track?.stop(); track?.release() } catch (_: Exception) {}
-                  client.dispatcher.executorService.shutdown()
-                  super.onDestroy()
-              }
-          }
-          EOF
-
-          cat > server/package.json <<'EOF'
-          {"name":"walkietalkiepro-relay","version":"1.0.0","private":true,"scripts":{"start":"node server.js"},"dependencies":{"ws":"^8.18.0"}}
-          EOF
-
-          cat > server/server.js <<'EOF'
-          const http = require("http");
-          const WebSocket = require("ws");
-          const server = http.createServer((req, res) => {
-            res.writeHead(200, {"content-type":"text/plain; charset=utf-8"});
-            res.end("WalkieTalkiePro relay is running");
-          });
-          const wss = new WebSocket.Server({server});
-          const rooms = new Map();
-          wss.on("connection", (socket, req) => {
-            const u = new URL(req.url, "http://localhost");
-            const room = (u.searchParams.get("room") || "room1").slice(0, 80);
-            if (!rooms.has(room)) rooms.set(room, new Set());
-            rooms.get(room).add(socket);
-            socket.on("message", (data, binary) => {
-              if (!binary) return;
-              for (const peer of rooms.get(room)) {
-                if (peer !== socket && peer.readyState === WebSocket.OPEN) peer.send(data, {binary:true});
-              }
-            });
-            socket.on("close", () => {
-              const group = rooms.get(room);
-              if (group) { group.delete(socket); if (!group.size) rooms.delete(room); }
-            });
-          });
-          server.listen(process.env.PORT || 8080, "0.0.0.0");
-          EOF
-
-          cat > README_AR.md <<'EOF'
-          # اللاسلكي الذكي WalkieTalkiePro
-          هذا المشروع يُنشأ تلقائياً عند تشغيل سير العمل.
-          - تطبيق أندرويد بواجهة عربية وزر اضغط باستمرار للتحدث.
-          - بلوتوث Classic: أحد الهاتفين يستضيف والآخر يتصل بجهاز مقترن.
-          - الإنترنت: نقل صوت داخل غرفة مشتركة عبر خادم WebSocket.
-          ## تشغيل الإنترنت
-          انشر مجلد server على استضافة Node.js تدعم WebSocket، ثم ضع رابط wss:// في التطبيق على كلا الهاتفين واستخدم اسم الغرفة نفسه. لا يوجد خادم مستضاف مسبقاً.
-          ## تنبيه
-          نقل الصوت الحالي PCM خام، وهو نموذج أولي يحتاج اختباراً وتحسيناً وترميزاً صوتياً ومصادقة قبل الاستخدام العام. لا يستطيع التطبيق زيادة مدى البلوتوث أو قوة إرساله.
-          EOF
-
-      - name: Build APK with Gradle
-        run: gradle --no-daemon assembleDebug
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: WalkieTalkiePro-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+                      base.contains
